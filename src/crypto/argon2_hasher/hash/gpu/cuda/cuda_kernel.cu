@@ -342,7 +342,6 @@ __global__ void fill_blocks(uint32_t *scratchpad0,
 							uint32_t *scratchpad3,
 							uint32_t *scratchpad4,
 							uint32_t *scratchpad5,
-							uint32_t *seed,
 							uint32_t *out,
                             uint32_t *refs, // 32 bit
                             uint32_t *idxs, // first bit is keep flag, next 31 bit is current idx
@@ -423,18 +422,6 @@ __global__ void fill_blocks(uint32_t *scratchpad0,
     if(scratchpad_location == 5) memory = reinterpret_cast<uint4*>(scratchpad5);
     int hash_offset = mem_hash - scratchpad_location * threads_per_chunk;
     memory = memory + hash_offset * (memsize >> 4); // memsize / 16 -> 16 bytes in uint4
-
-	uint32_t *mem_seed = seed + hash * lanes * 2 * BLOCK_SIZE_UINT;
-
-	uint32_t *seed_src = mem_seed + lane * 2 * BLOCK_SIZE_UINT;
-	uint4 *seed_dst = memory + lane * lane_length * BLOCK_SIZE_UINT4;
-
-	seed_dst[id] = make_uint4(seed_src[i1_0_0], seed_src[i1_0_1], seed_src[i1_1_0], seed_src[i1_1_1]);
-	seed_dst[id + 32] = make_uint4(seed_src[i1_2_0], seed_src[i1_2_1], seed_src[i1_3_0], seed_src[i1_3_1]);
-	seed_src += BLOCK_SIZE_UINT;
-	seed_dst += BLOCK_SIZE_UINT4;
-	seed_dst[id] = make_uint4(seed_src[i1_0_0], seed_src[i1_0_1], seed_src[i1_1_0], seed_src[i1_1_1]);
-	seed_dst[id + 32] = make_uint4(seed_src[i1_2_0], seed_src[i1_2_1], seed_src[i1_3_0], seed_src[i1_3_1]);
 
 	uint4 *next_block;
 	uint4 *prev_block;
@@ -631,15 +618,23 @@ __global__ void fill_blocks(uint32_t *scratchpad0,
 	}
 };
 
-__global__ void prehash (
-        uint32_t *preseed,
-        uint32_t *seed,
-		int memsz,
-		int lanes,
-		int passes,
-		int pwdlen,
-		int saltlen,
-        int threads) { // len is given in uint32 units
+__global__ void prehash (uint32_t *scratchpad0,
+                        uint32_t *scratchpad1,
+                        uint32_t *scratchpad2,
+                        uint32_t *scratchpad3,
+                        uint32_t *scratchpad4,
+                        uint32_t *scratchpad5,
+                        uint32_t *preseed,
+                        int memsize,
+                        int memcost,
+                        int lanes,
+                        int passes,
+                        int pwdlen,
+                        int saltlen,
+                        int seg_length,
+                        int threads,
+                        int threads_per_chunk,
+                        int thread_idx) { // len is given in uint32 units
     extern __shared__ uint32_t shared[]; // size = max(lanes * 2, 8) * 88
 
 	int seeds_batch_size = blockDim.x / 4; // number of seeds per block
@@ -649,18 +644,17 @@ __global__ void prehash (
 	int thr_id = id % 4; // thread id in session
 	int session = id / 4; // blake2b hashing session
 
-    int hash = blockIdx.x * hash_batch_size;
+    int hash_base = blockIdx.x * hash_batch_size;
     int hash_idx = session / (lanes * 2);
-    hash += hash_idx;
 
-    if(hash < threads) {
+    if((hash_base + hash_idx) < threads) {
         int hash_session = session % (lanes * 2); // session in hash
 
         int lane = hash_session / 2;  // 2 lanes
         int idx = hash_session % 2; // idx in lane
 
-        uint32_t *local_mem = &shared[session * BLAKE_SHARED_MEM_UINT];
-        uint32_t *local_seed = seed + (hash * lanes * 2 + hash_session) * BLOCK_SIZE_UINT;
+        uint32_t *local_outBuff = &shared[session * BLOCK_SIZE_UINT];
+        uint32_t *local_mem = &shared[seeds_batch_size * BLOCK_SIZE_UINT + session * BLAKE_SHARED_MEM_UINT];
 
         uint64_t *h = (uint64_t *) &local_mem[20];
         uint32_t *buf = (uint32_t *) &h[10];
@@ -680,7 +674,7 @@ __global__ void prehash (
             }
 
             uint32_t nonce = (preseed[9] >> 24) | (preseed[10] << 8);
-            nonce += hash;
+            nonce += (hash_base + hash_idx);
             local_preseed[9] = (preseed[9] & 0x00FFFFFF) | (nonce << 24);
             local_preseed[10] = (preseed[10] & 0xFF000000) | (nonce >> 8);
         }
@@ -690,7 +684,7 @@ __global__ void prehash (
         buf_len = blake2b_update(value, 1, h, buf, buf_len, thr_id);
         *value = 32; //outlen
         buf_len = blake2b_update(value, 1, h, buf, buf_len, thr_id);
-        *value = memsz; //m_cost
+        *value = memcost; //m_cost
         buf_len = blake2b_update(value, 1, h, buf, buf_len, thr_id);
         *value = passes; //t_cost
         buf_len = blake2b_update(value, 1, h, buf, buf_len, thr_id);
@@ -718,8 +712,57 @@ __global__ void prehash (
             local_mem[ARGON2_PREHASH_DIGEST_LENGTH_UINT + 1] = lane;
         }
 
-        blake2b_digestLong(local_seed, ARGON2_DWORDS_IN_BLOCK, local_mem, ARGON2_PREHASH_SEED_LENGTH_UINT, thr_id,
-                           &local_mem[20]);
+        blake2b_digestLong(local_outBuff, ARGON2_DWORDS_IN_BLOCK, local_mem, ARGON2_PREHASH_SEED_LENGTH_UINT, thr_id,
+            &local_mem[20]);
+    }
+
+    int mem_hash = hash_base + thread_idx;
+    int scratchpad_location = mem_hash / threads_per_chunk;
+    uint4 *memory = reinterpret_cast<uint4 *>(scratchpad0);
+    if(scratchpad_location == 1)
+    memory = reinterpret_cast<uint4 *>(scratchpad1);
+    if(scratchpad_location == 2)
+    memory = reinterpret_cast<uint4 *>(scratchpad2);
+    if(scratchpad_location == 3)
+    memory = reinterpret_cast<uint4 *>(scratchpad3);
+    if(scratchpad_location == 4)
+    memory = reinterpret_cast<uint4 *>(scratchpad4);
+    if(scratchpad_location == 5)
+    memory = reinterpret_cast<uint4 *>(scratchpad5);
+    int hash_offset = mem_hash - scratchpad_location * threads_per_chunk;
+    memory = memory + hash_offset * (memsize >> 4); // memsize / 16 -> 16 bytes in uint4
+
+    int lane_length = seg_length * 4;
+
+    if(id < 32) {
+        int offset = id << 2;
+
+        int i1_0_0 = 2 * offsets[offset];
+        int i1_0_1 = i1_0_0 + 1;
+        int i1_1_0 = 2 * offsets[offset + 1];
+        int i1_1_1 = i1_1_0 + 1;
+        int i1_2_0 = 2 * offsets[offset + 2];
+        int i1_2_1 = i1_2_0 + 1;
+        int i1_3_0 = 2 * offsets[offset + 3];
+        int i1_3_1 = i1_3_0 + 1;
+
+        for(int hIdx = 0; (hIdx < hash_batch_size) && ((hash_base + hIdx) < threads); hIdx++) {
+            uint4 *mem_hash = memory + hIdx * (memsize >> 4);
+
+            uint32_t *mem_seed = shared + hIdx * lanes * 2 * BLOCK_SIZE_UINT;
+
+            for(int l = 0; l < lanes; l++) {
+                uint32_t *seed_src = mem_seed + l * 2 * BLOCK_SIZE_UINT;
+                uint4 *seed_dst = mem_hash + l * lane_length * BLOCK_SIZE_UINT4;
+
+                seed_dst[id] = make_uint4(seed_src[i1_0_0], seed_src[i1_0_1], seed_src[i1_1_0], seed_src[i1_1_1]);
+                seed_dst[id + 32] = make_uint4(seed_src[i1_2_0], seed_src[i1_2_1], seed_src[i1_3_0], seed_src[i1_3_1]);
+                seed_src += BLOCK_SIZE_UINT;
+                seed_dst += BLOCK_SIZE_UINT4;
+                seed_dst[id] = make_uint4(seed_src[i1_0_0], seed_src[i1_0_1], seed_src[i1_1_0], seed_src[i1_1_1]);
+                seed_dst[id + 32] = make_uint4(seed_src[i1_2_0], seed_src[i1_2_1], seed_src[i1_3_0], seed_src[i1_3_1]);
+            }
+        }
     }
 }
 
@@ -1059,15 +1102,24 @@ bool cuda_kernel_prehasher(void *memory, int threads, Argon2Profile *profile, vo
         return false;
     }
 
-	prehash <<< ceil(threads / hashes_per_block), work_items, sessions * BLAKE_SHARED_MEM, stream>>> (
+	prehash <<< ceil(threads / hashes_per_block), work_items, sessions * (BLAKE_SHARED_MEM + ARGON2_BLOCK_SIZE), stream>>> (
+            (uint32_t*)device->arguments.memoryChunk_0,
+            (uint32_t*)device->arguments.memoryChunk_1,
+            (uint32_t*)device->arguments.memoryChunk_2,
+            (uint32_t*)device->arguments.memoryChunk_3,
+            (uint32_t*)device->arguments.memoryChunk_4,
+            (uint32_t*)device->arguments.memoryChunk_5,
 			device->arguments.preseedMemory[gpumgmt_thread->threadId],
-			device->arguments.seedMemory[gpumgmt_thread->threadId],
-			profile->memCost,
+            profile->memSize,
+            profile->memCost,
 			profile->thrCost,
 			profile->segCount / (4 * profile->thrCost),
             gpumgmt_thread->hashData.inSize / 4,
 			profile->saltLen,
-            threads);
+            profile->segSize,
+            threads,
+            device->profileInfo.threads_per_chunk,
+            gpumgmt_thread->threadsIdx);
 
     return true;
 }
@@ -1086,7 +1138,6 @@ void *cuda_kernel_filler(int threads, Argon2Profile *profile, void *user_data) {
 			(uint32_t*)device->arguments.memoryChunk_3,
 			(uint32_t*)device->arguments.memoryChunk_4,
 			(uint32_t*)device->arguments.memoryChunk_5,
-			device->arguments.seedMemory[gpumgmt_thread->threadId],
 			device->arguments.outMemory[gpumgmt_thread->threadId],
 			device->arguments.refs,
 			device->arguments.idxs,
