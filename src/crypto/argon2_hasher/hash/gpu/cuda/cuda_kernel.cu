@@ -9,17 +9,17 @@
 
 #include "CudaHasher.h"
 
-#define THREADS_PER_LANE               32
-#define BLOCK_SIZE_UINT4                64
-#define BLOCK_SIZE_UINT                256
-#define KERNEL_WORKGROUP_SIZE   		32
+#define THREADS_PER_LANE                    8
+#define BLOCK_SIZE_UINT4                    64
+#define BLOCK_SIZE_UINT                     256
+#define KERNEL_WORKGROUP_SIZE   		    32
 #define ARGON2_PREHASH_DIGEST_LENGTH_UINT   16
 #define ARGON2_PREHASH_SEED_LENGTH_UINT     18
 
 
 #include "blake2b.cu"
 
-#define COMPUTE	\
+#define COMPUTE(alo, ahi, blo, bhi, clo, chi, dlo, dhi)	\
 	asm ("{"	\
 		".reg .u32 s1, s2, s3, s4;\n\t"	\
 		"mul.lo.u32 s3, %0, %2;\n\t"	\
@@ -69,268 +69,44 @@
 		"xor.b32 s4, %3, %5;\n\t"	\
 		"shf.r.wrap.b32 %3, s3, s4, 31;\n\t"	\
 		"shf.r.wrap.b32 %2, s4, s3, 31;\n\t"	\
-	"}" : "+r"(tmp_a.x), "+r"(tmp_a.y), "+r"(tmp_a.z), "+r"(tmp_a.w), "+r"(tmp_b.x), "+r"(tmp_b.y), "+r"(tmp_b.z), "+r"(tmp_b.w));
+	"}" : "+r"(alo), "+r"(ahi), "+r"(blo), "+r"(bhi), "+r"(clo), "+r"(chi), "+r"(dlo), "+r"(dhi));
 
-#define G1(data)           \
+#define G1()           \
 {                           \
-	COMPUTE \
-	tmp_a.z = __shfl_sync(0xffffffff, tmp_a.z, i_shfl1_1); \
-	tmp_a.w = __shfl_sync(0xffffffff, tmp_a.w, i_shfl1_1); \
-	tmp_b.x = __shfl_sync(0xffffffff, tmp_b.x, i_shfl1_2); \
-	tmp_b.y = __shfl_sync(0xffffffff, tmp_b.y, i_shfl1_2); \
-	tmp_b.z = __shfl_sync(0xffffffff, tmp_b.z, i_shfl1_3); \
-	tmp_b.w = __shfl_sync(0xffffffff, tmp_b.w, i_shfl1_3); \
+    COMPUTE(data_a.x, data_a.y, data_c.x, data_c.y, data_e.x, data_e.y, data_g.x, data_g.y) \
+    COMPUTE(data_a.z, data_a.w, data_c.z, data_c.w, data_e.z, data_e.w, data_g.z, data_g.w) \
+    COMPUTE(data_b.x, data_b.y, data_d.x, data_d.y, data_f.x, data_f.y, data_h.x, data_h.y) \
+    COMPUTE(data_b.z, data_b.w, data_d.z, data_d.w, data_f.z, data_f.w, data_h.z, data_h.w) \
 }
 
-#define G2(data)           \
-{ \
-	COMPUTE \
-    data[i2_0_0] = tmp_a.x; \
-    data[i2_0_1] = tmp_a.y; \
-    data[i2_1_0] = tmp_a.z; \
-    data[i2_1_1] = tmp_a.w; \
-    data[i2_2_0] = tmp_b.x; \
-    data[i2_2_1] = tmp_b.y; \
-    data[i2_3_0] = tmp_b.z; \
-    data[i2_3_1] = tmp_b.w; \
+#define G2()           \
+{                           \
+    COMPUTE(data_a.x, data_a.y, data_c.z, data_c.w, data_f.x, data_f.y, data_h.z, data_h.w) \
+    COMPUTE(data_a.z, data_a.w, data_d.x, data_d.y, data_f.z, data_f.w, data_g.x, data_g.y) \
+    COMPUTE(data_b.x, data_b.y, data_d.z, data_d.w, data_e.x, data_e.y, data_g.z, data_g.w) \
+    COMPUTE(data_b.z, data_b.w, data_c.x, data_c.y, data_e.z, data_e.w, data_h.x, data_h.y) \
+}
+
+#define SHUFFLE() \
+{           \
+    local_mem[id] = data_a; \
+    local_mem[id + 8] = data_b; \
+    local_mem[id + 16] = data_c; \
+    local_mem[id + 24] = data_d; \
+    local_mem[id + 32] = data_e; \
+    local_mem[id + 40] = data_f; \
+    local_mem[id + 48] = data_g; \
+    local_mem[id + 56] = data_h; \
     __syncwarp(); \
+    data_a = local_mem[id * 8]; \
+    data_b = local_mem[id * 8 + 1]; \
+    data_c = local_mem[id * 8 + 2]; \
+    data_d = local_mem[id * 8 + 3]; \
+    data_e = local_mem[id * 8 + 4]; \
+    data_f = local_mem[id * 8 + 5]; \
+    data_g = local_mem[id * 8 + 6]; \
+    data_h = local_mem[id * 8 + 7]; \
 }
-
-#define G3(data)           \
-{                           \
-    tmp_a.x = data[i3_0_0]; \
-    tmp_a.y = data[i3_0_1]; \
-    tmp_a.z = data[i3_1_0]; \
-    tmp_a.w = data[i3_1_1]; \
-    tmp_b.x = data[i3_2_0]; \
-    tmp_b.y = data[i3_2_1]; \
-    tmp_b.z = data[i3_3_0]; \
-    tmp_b.w = data[i3_3_1]; \
-	COMPUTE \
-	tmp_a.z = __shfl_sync(0xffffffff, tmp_a.z, i_shfl2_1); \
-	tmp_a.w = __shfl_sync(0xffffffff, tmp_a.w, i_shfl2_1); \
-	tmp_b.x = __shfl_sync(0xffffffff, tmp_b.x, i_shfl2_2); \
-	tmp_b.y = __shfl_sync(0xffffffff, tmp_b.y, i_shfl2_2); \
-	tmp_b.z = __shfl_sync(0xffffffff, tmp_b.z, i_shfl2_3); \
-	tmp_b.w = __shfl_sync(0xffffffff, tmp_b.w, i_shfl2_3); \
-}
-
-#define G4(data)           \
-{                           \
-	COMPUTE \
-    data[i4_0_0] = tmp_a.x; \
-    data[i4_0_1] = tmp_a.y; \
-    data[i4_1_0] = tmp_a.z; \
-    data[i4_1_1] = tmp_a.w; \
-    data[i4_2_0] = tmp_b.x; \
-    data[i4_2_1] = tmp_b.y; \
-    data[i4_3_0] = tmp_b.z; \
-    data[i4_3_1] = tmp_b.w; \
-    __syncwarp(); \
-    tmp_a.x = data[i1_0_0]; \
-    tmp_a.y = data[i1_0_1]; \
-    tmp_a.z = data[i1_1_0]; \
-    tmp_a.w = data[i1_1_1]; \
-    tmp_b.x = data[i1_2_0]; \
-    tmp_b.y = data[i1_2_1]; \
-    tmp_b.z = data[i1_3_0]; \
-    tmp_b.w = data[i1_3_1]; \
-}
-
-__constant__ int offsets[768] = {
-		0, 4, 8, 12,
-		1, 5, 9, 13,
-		2, 6, 10, 14,
-		3, 7, 11, 15,
-		16, 20, 24, 28,
-		17, 21, 25, 29,
-		18, 22, 26, 30,
-		19, 23, 27, 31,
-		32, 36, 40, 44,
-		33, 37, 41, 45,
-		34, 38, 42, 46,
-		35, 39, 43, 47,
-		48, 52, 56, 60,
-		49, 53, 57, 61,
-		50, 54, 58, 62,
-		51, 55, 59, 63,
-		64, 68, 72, 76,
-		65, 69, 73, 77,
-		66, 70, 74, 78,
-		67, 71, 75, 79,
-		80, 84, 88, 92,
-		81, 85, 89, 93,
-		82, 86, 90, 94,
-		83, 87, 91, 95,
-		96, 100, 104, 108,
-		97, 101, 105, 109,
-		98, 102, 106, 110,
-		99, 103, 107, 111,
-		112, 116, 120, 124,
-		113, 117, 121, 125,
-		114, 118, 122, 126,
-		115, 119, 123, 127,
-		0, 5, 10, 15,
-		1, 6, 11, 12,
-		2, 7, 8, 13,
-		3, 4, 9, 14,
-		16, 21, 26, 31,
-		17, 22, 27, 28,
-		18, 23, 24, 29,
-		19, 20, 25, 30,
-		32, 37, 42, 47,
-		33, 38, 43, 44,
-		34, 39, 40, 45,
-		35, 36, 41, 46,
-		48, 53, 58, 63,
-		49, 54, 59, 60,
-		50, 55, 56, 61,
-		51, 52, 57, 62,
-		64, 69, 74, 79,
-		65, 70, 75, 76,
-		66, 71, 72, 77,
-		67, 68, 73, 78,
-		80, 85, 90, 95,
-		81, 86, 91, 92,
-		82, 87, 88, 93,
-		83, 84, 89, 94,
-		96, 101, 106, 111,
-		97, 102, 107, 108,
-		98, 103, 104, 109,
-		99, 100, 105, 110,
-		112, 117, 122, 127,
-		113, 118, 123, 124,
-		114, 119, 120, 125,
-		115, 116, 121, 126,
-		0, 32, 64, 96,
-		1, 33, 65, 97,
-		2, 34, 66, 98,
-		3, 35, 67, 99,
-		4, 36, 68, 100,
-		5, 37, 69, 101,
-		6, 38, 70, 102,
-		7, 39, 71, 103,
-		8, 40, 72, 104,
-		9, 41, 73, 105,
-		10, 42, 74, 106,
-		11, 43, 75, 107,
-		12, 44, 76, 108,
-		13, 45, 77, 109,
-		14, 46, 78, 110,
-		15, 47, 79, 111,
-		16, 48, 80, 112,
-		17, 49, 81, 113,
-		18, 50, 82, 114,
-		19, 51, 83, 115,
-		20, 52, 84, 116,
-		21, 53, 85, 117,
-		22, 54, 86, 118,
-		23, 55, 87, 119,
-		24, 56, 88, 120,
-		25, 57, 89, 121,
-		26, 58, 90, 122,
-		27, 59, 91, 123,
-		28, 60, 92, 124,
-		29, 61, 93, 125,
-		30, 62, 94, 126,
-		31, 63, 95, 127,
-		0, 33, 80, 113,
-		1, 48, 81, 96,
-		2, 35, 82, 115,
-		3, 50, 83, 98,
-		4, 37, 84, 117,
-		5, 52, 85, 100,
-		6, 39, 86, 119,
-		7, 54, 87, 102,
-		8, 41, 88, 121,
-		9, 56, 89, 104,
-		10, 43, 90, 123,
-		11, 58, 91, 106,
-		12, 45, 92, 125,
-		13, 60, 93, 108,
-		14, 47, 94, 127,
-		15, 62, 95, 110,
-		16, 49, 64, 97,
-		17, 32, 65, 112,
-		18, 51, 66, 99,
-		19, 34, 67, 114,
-		20, 53, 68, 101,
-		21, 36, 69, 116,
-		22, 55, 70, 103,
-		23, 38, 71, 118,
-		24, 57, 72, 105,
-		25, 40, 73, 120,
-		26, 59, 74, 107,
-		27, 42, 75, 122,
-		28, 61, 76, 109,
-		29, 44, 77, 124,
-		30, 63, 78, 111,
-		31, 46, 79, 126,
-        0, 1, 2, 3,
-        1, 2, 3, 0,
-        2, 3, 0, 1,
-        3, 0, 1, 2,
-        4, 5, 6, 7,
-        5, 6, 7, 4,
-        6, 7, 4, 5,
-        7, 4, 5, 6,
-        8, 9, 10, 11,
-        9, 10, 11, 8,
-        10, 11, 8, 9,
-        11, 8, 9, 10,
-        12, 13, 14, 15,
-        13, 14, 15, 12,
-        14, 15, 12, 13,
-        15, 12, 13, 14,
-        16, 17, 18, 19,
-        17, 18, 19, 16,
-        18, 19, 16, 17,
-        19, 16, 17, 18,
-        20, 21, 22, 23,
-        21, 22, 23, 20,
-        22, 23, 20, 21,
-        23, 20, 21, 22,
-        24, 25, 26, 27,
-        25, 26, 27, 24,
-        26, 27, 24, 25,
-        27, 24, 25, 26,
-        28, 29, 30, 31,
-        29, 30, 31, 28,
-        30, 31, 28, 29,
-        31, 28, 29, 30,
-        0, 1, 16, 17,
-        1, 16, 17, 0,
-        2, 3, 18, 19,
-        3, 18, 19, 2,
-        4, 5, 20, 21,
-        5, 20, 21, 4,
-        6, 7, 22, 23,
-        7, 22, 23, 6,
-        8, 9, 24, 25,
-        9, 24, 25, 8,
-        10, 11, 26, 27,
-        11, 26, 27, 10,
-        12, 13, 28, 29,
-        13, 28, 29, 12,
-        14, 15, 30, 31,
-        15, 30, 31, 14,
-        16, 17, 0, 1,
-        17, 0, 1, 16,
-        18, 19, 2, 3,
-        19, 2, 3, 18,
-        20, 21, 4, 5,
-        21, 4, 5, 20,
-        22, 23, 6, 7,
-        23, 6, 7, 22,
-        24, 25, 8, 9,
-        25, 8, 9, 24,
-        26, 27, 10, 11,
-        27, 10, 11, 26,
-        28, 29, 12, 13,
-        29, 12, 13, 28,
-        30, 31, 14, 15,
-        31, 14, 15, 30
-};
 
 inline __host__ __device__ void operator^=( uint4& a, uint4 s) {
    a.x ^= s.x; a.y ^= s.y; a.z ^= s.z; a.w ^= s.w;
@@ -342,7 +118,6 @@ __global__ void fill_blocks(uint32_t *scratchpad0,
 							uint32_t *scratchpad3,
 							uint32_t *scratchpad4,
 							uint32_t *scratchpad5,
-							uint32_t *seed,
 							uint32_t *out,
                             uint32_t *refs, // 32 bit
                             uint32_t *idxs, // first bit is keep flag, next 31 bit is current idx
@@ -353,66 +128,24 @@ __global__ void fill_blocks(uint32_t *scratchpad0,
                             int seg_count,
 							int threads_per_chunk,
 							int thread_idx) {
-    extern __shared__ uint32_t shared[]; // lanes * BLOCK_SIZE_UINT [local state] + lanes * 32 [refs buffer] ( + lanes * 32 [idx buffer])
+    extern __shared__ uint32_t shared[];
+    uint4 data_a, data_b, data_c, data_d, data_e, data_f, data_g, data_h;
+    uint4 saved_a, saved_b, saved_c, saved_d, saved_e, saved_f, saved_g, saved_h;
 
-	uint32_t *local_state = shared;
-	uint32_t *local_refs = shared + (lanes * BLOCK_SIZE_UINT);
-	uint32_t *local_idxs = shared + (lanes * BLOCK_SIZE_UINT + lanes * 32);
+    int session = threadIdx.x / THREADS_PER_LANE;
+    int id = threadIdx.x % THREADS_PER_LANE;
+    int wave_id = threadIdx.x % 32;
 
-	uint4 tmp_a, tmp_b, tmp_c, tmp_d, tmp_p, tmp_q, tmp_l, tmp_m;
+    int local_hash = session % 4;
+    int lane = session / 4; // 4 hashes session for each lane
+    int base_hash = (blockIdx.x * 4);
+    int mem_hash = base_hash + thread_idx;
 
-	int hash = blockIdx.x;
-	int mem_hash = hash + thread_idx;
-	int local_id = threadIdx.x;
 	int lane_length = seg_length * 4;
 
-	int id = local_id % THREADS_PER_LANE;
-	int lane = local_id / THREADS_PER_LANE;
-
-	int offset = id << 2;
-
-	int i1_0_0 = 2 * offsets[offset];
-	int i1_0_1 = i1_0_0 + 1;
-	int i1_1_0 = 2 * offsets[offset + 1];
-	int i1_1_1 = i1_1_0 + 1;
-	int i1_2_0 = 2 * offsets[offset + 2];
-	int i1_2_1 = i1_2_0 + 1;
-	int i1_3_0 = 2 * offsets[offset + 3];
-	int i1_3_1 = i1_3_0 + 1;
-
-	int i2_0_0 = 2 * offsets[offset + 128];
-	int i2_0_1 = i2_0_0 + 1;
-	int i2_1_0 = 2 * offsets[offset + 129];
-	int i2_1_1 = i2_1_0 + 1;
-	int i2_2_0 = 2 * offsets[offset + 130];
-	int i2_2_1 = i2_2_0 + 1;
-	int i2_3_0 = 2 * offsets[offset + 131];
-	int i2_3_1 = i2_3_0 + 1;
-
-	int i3_0_0 = 2 * offsets[offset + 256];
-	int i3_0_1 = i3_0_0 + 1;
-	int i3_1_0 = 2 * offsets[offset + 257];
-	int i3_1_1 = i3_1_0 + 1;
-	int i3_2_0 = 2 * offsets[offset + 258];
-	int i3_2_1 = i3_2_0 + 1;
-	int i3_3_0 = 2 * offsets[offset + 259];
-	int i3_3_1 = i3_3_0 + 1;
-
-	int i4_0_0 = 2 * offsets[offset + 384];
-	int i4_0_1 = i4_0_0 + 1;
-	int i4_1_0 = 2 * offsets[offset + 385];
-	int i4_1_1 = i4_1_0 + 1;
-	int i4_2_0 = 2 * offsets[offset + 386];
-	int i4_2_1 = i4_2_0 + 1;
-	int i4_3_0 = 2 * offsets[offset + 387];
-	int i4_3_1 = i4_3_0 + 1;
-
-	int i_shfl1_1 = offsets[offset + 513];
-	int i_shfl1_2 = offsets[offset + 514];
-	int i_shfl1_3 = offsets[offset + 515];
-	int i_shfl2_1 = offsets[offset + 641];
-	int i_shfl2_2 = offsets[offset + 642];
-	int i_shfl2_3 = offsets[offset + 643];
+    uint4 *local_mem = reinterpret_cast<uint4*>(shared + (lane + local_hash * lanes) * BLOCK_SIZE_UINT);
+    uint32_t *local_refs = shared + lanes * 4 * BLOCK_SIZE_UINT + lane * 32;
+    uint32_t *local_idxs = shared + lanes * 4 * BLOCK_SIZE_UINT + (lanes + lane) * 32;
 
     int scratchpad_location = mem_hash / threads_per_chunk;
     uint4 *memory = reinterpret_cast<uint4*>(scratchpad0);
@@ -424,26 +157,10 @@ __global__ void fill_blocks(uint32_t *scratchpad0,
     int hash_offset = mem_hash - scratchpad_location * threads_per_chunk;
     memory = memory + hash_offset * (memsize >> 4); // memsize / 16 -> 16 bytes in uint4
 
-	uint32_t *mem_seed = seed + hash * lanes * 2 * BLOCK_SIZE_UINT;
-
-	uint32_t *seed_src = mem_seed + lane * 2 * BLOCK_SIZE_UINT;
-	uint4 *seed_dst = memory + lane * lane_length * BLOCK_SIZE_UINT4;
-
-	seed_dst[id] = make_uint4(seed_src[i1_0_0], seed_src[i1_0_1], seed_src[i1_1_0], seed_src[i1_1_1]);
-	seed_dst[id + 32] = make_uint4(seed_src[i1_2_0], seed_src[i1_2_1], seed_src[i1_3_0], seed_src[i1_3_1]);
-	seed_src += BLOCK_SIZE_UINT;
-	seed_dst += BLOCK_SIZE_UINT4;
-	seed_dst[id] = make_uint4(seed_src[i1_0_0], seed_src[i1_0_1], seed_src[i1_1_0], seed_src[i1_1_1]);
-	seed_dst[id + 32] = make_uint4(seed_src[i1_2_0], seed_src[i1_2_1], seed_src[i1_3_0], seed_src[i1_3_1]);
-
 	uint4 *next_block;
 	uint4 *prev_block;
 	uint4 *ref_block;
     uint32_t *seg_refs, *seg_idxs;
-
-	local_state = local_state + lane * BLOCK_SIZE_UINT;
-	local_refs = local_refs + lane * 32;
-	local_idxs = local_idxs + lane * 32;
 
     segments += (lane * 3);
 
@@ -461,10 +178,16 @@ __global__ void fill_blocks(uint32_t *scratchpad0,
         uint32_t seg_type = cur_seg[2];
         uint32_t ref_idx = 0;
 
-        prev_block = memory + prev_idx * BLOCK_SIZE_UINT4;
+        prev_block = memory + prev_idx * BLOCK_SIZE_UINT4 * 4; // 4 hashes are intercalated in a single block
 
-        tmp_a = prev_block[id];
-        tmp_b = prev_block[id + 32];
+        data_a = prev_block[wave_id];
+        data_b = prev_block[wave_id + 32];
+        data_c = prev_block[wave_id + 64];
+        data_d = prev_block[wave_id + 96];
+        data_e = prev_block[wave_id + 128];
+        data_f = prev_block[wave_id + 160];
+        data_g = prev_block[wave_id + 192];
+        data_h = prev_block[wave_id + 224];
 
         __syncthreads();
 
@@ -476,82 +199,88 @@ __global__ void fill_blocks(uint32_t *scratchpad0,
 				uint64_t i_limit = seg_length - idx;
 				if (i_limit > 32) i_limit = 32;
 
-				local_refs[id] = seg_refs[id];
-				ref_idx = local_refs[0];
+                local_refs[wave_id] = seg_refs[wave_id];
 
-				if(idxs != NULL) {
-					local_idxs[id] = seg_idxs[id];
-					cur_idx = local_idxs[0];
-					keep = cur_idx & 0x80000000;
-					cur_idx = cur_idx & 0x7FFFFFFF;
-				} else
-				    cur_idx++;
-
-                ref_block = memory + ref_idx * BLOCK_SIZE_UINT4;
-                tmp_p = ref_block[id];
-                tmp_q = ref_block[id + 32];
+                if(idxs != NULL) {
+                    local_idxs[wave_id] = seg_idxs[wave_id];
+                }
 
                 for (int i = 0; i < i_limit; i++, idx++) {
-                    next_block = memory + cur_idx * BLOCK_SIZE_UINT4;
-					if(with_xor == 1) {
-						tmp_l = next_block[id];
-						tmp_m = next_block[id + 32];
-					}
+                    ref_idx = local_refs[i];
 
-					tmp_a ^= tmp_p;
-                    tmp_b ^= tmp_q;
-
-                    if (i < (i_limit - 1)) {
-						ref_idx = local_refs[i + 1];
-
-						if(idxs != NULL) {
-							cur_idx = local_idxs[i + 1];
-							keep = cur_idx & 0x80000000;
-							cur_idx = cur_idx & 0x7FFFFFFF;
-						}
-						else
-							cur_idx++;
-
-                        ref_block = memory + ref_idx * BLOCK_SIZE_UINT4;
-                        tmp_p = ref_block[id];
-                        tmp_q = ref_block[id + 32];
+                    if(idxs != NULL) {
+                        cur_idx = local_idxs[i];
+                        keep = cur_idx & 0x80000000;
+                        cur_idx = cur_idx & 0x7FFFFFFF;
                     }
+                    else
+                        cur_idx++;
 
-					tmp_c = tmp_a;
-					tmp_d = tmp_b;
+                    ref_block = memory + ref_idx * BLOCK_SIZE_UINT4 * 4;
+                    next_block = memory + cur_idx * BLOCK_SIZE_UINT4 * 4;
 
-					G1(local_state);
-                    G2(local_state);
-                    G3(local_state);
-                    G4(local_state);
+                    data_a ^= ref_block[wave_id];
+                    data_b ^= ref_block[wave_id + 32];
+                    data_c ^= ref_block[wave_id + 64];
+                    data_d ^= ref_block[wave_id + 96];
+                    data_e ^= ref_block[wave_id + 128];
+                    data_f ^= ref_block[wave_id + 160];
+                    data_g ^= ref_block[wave_id + 192];
+                    data_h ^= ref_block[wave_id + 224];
+
+                    saved_a = data_a;
+                    saved_b = data_b;
+                    saved_c = data_c;
+                    saved_d = data_d;
+                    saved_e = data_e;
+                    saved_f = data_f;
+                    saved_g = data_g;
+                    saved_h = data_h;
+
+					G1();
+                    G2();
+                    SHUFFLE();
+                    G1();
+                    G2();
+                    SHUFFLE();
 
                     if(with_xor == 1) {
-						tmp_c ^= tmp_l;
-						tmp_d ^= tmp_m;
-					}
+                        saved_a ^= next_block[wave_id];
+                        saved_b ^= next_block[wave_id + 32];
+                        saved_c ^= next_block[wave_id + 64];
+                        saved_d ^= next_block[wave_id + 96];
+                        saved_e ^= next_block[wave_id + 128];
+                        saved_f ^= next_block[wave_id + 160];
+                        saved_g ^= next_block[wave_id + 192];
+                        saved_h ^= next_block[wave_id + 224];
+                    }
 
-                    tmp_a ^= tmp_c;
-                    tmp_b ^= tmp_d;
+                    data_a ^= saved_a;
+                    data_b ^= saved_b;
+                    data_c ^= saved_c;
+                    data_d ^= saved_d;
+                    data_e ^= saved_e;
+                    data_f ^= saved_f;
+                    data_g ^= saved_g;
+                    data_h ^= saved_h;
 
                     if(keep > 0) {
-						next_block[id] = tmp_a;
-						next_block[id + 32] = tmp_b;
+                        next_block[wave_id] = data_a;
+                        next_block[wave_id + 32] = data_b;
+                        next_block[wave_id + 64] = data_c;
+                        next_block[wave_id + 96] = data_d;
+                        next_block[wave_id + 128] = data_e;
+                        next_block[wave_id + 160] = data_f;
+                        next_block[wave_id + 192] = data_g;
+                        next_block[wave_id + 224] = data_h;
 					}
                 }
             }
         }
         else {
-
             for (; idx < seg_length; idx++, cur_idx++) {
-				next_block = memory + cur_idx * BLOCK_SIZE_UINT4;
-
-				if(with_xor == 1) {
-					tmp_l = next_block[id];
-					tmp_m = next_block[id + 32];
-				}
-
-				uint32_t pseudo_rand_lo = __shfl_sync(0xffffffff, tmp_a.x, 0);
-				uint32_t pseudo_rand_hi = __shfl_sync(0xffffffff, tmp_a.y, 0);
+				uint32_t pseudo_rand_lo = __shfl_sync(0xffffffff, data_a.x, local_hash * 8);
+				uint32_t pseudo_rand_hi = __shfl_sync(0xffffffff, data_a.y, local_hash * 8);
 
 				uint64_t ref_lane = pseudo_rand_hi % lanes; // thr_cost
 				uint32_t reference_area_size = 0;
@@ -575,71 +304,131 @@ __global__ void fill_blocks(uint32_t *scratchpad0,
 
 				ref_idx = ref_lane * lane_length + (((pass > 0 && slice < 3) ? ((slice + 1) * seg_length) : 0) + relative_position) % lane_length;
 
-				ref_block = memory + ref_idx * BLOCK_SIZE_UINT4;
+				ref_block = memory + ref_idx * BLOCK_SIZE_UINT4 * 4;
+                next_block = memory + cur_idx * BLOCK_SIZE_UINT4 * 4;
 
-				tmp_a ^= ref_block[id];
-				tmp_b ^= ref_block[id + 32];
+                data_a ^= ref_block[wave_id];
+                data_b ^= ref_block[wave_id + 32];
+                data_c ^= ref_block[wave_id + 64];
+                data_d ^= ref_block[wave_id + 96];
+                data_e ^= ref_block[wave_id + 128];
+                data_f ^= ref_block[wave_id + 160];
+                data_g ^= ref_block[wave_id + 192];
+                data_h ^= ref_block[wave_id + 224];
 
-				tmp_c = tmp_a;
-				tmp_d = tmp_b;
+                saved_a = data_a;
+                saved_b = data_b;
+                saved_c = data_c;
+                saved_d = data_d;
+                saved_e = data_e;
+                saved_f = data_f;
+                saved_g = data_g;
+                saved_h = data_h;
 
-				G1(local_state);
-				G2(local_state);
-				G3(local_state);
-				G4(local_state);
+                G1();
+                G2();
+                SHUFFLE();
+                G1();
+                G2();
+                SHUFFLE();
 
-				if(with_xor == 1) {
-					tmp_c ^= tmp_l;
-					tmp_d ^= tmp_m;
-				}
+                if(with_xor == 1) {
+                    saved_a ^= next_block[wave_id];
+                    saved_b ^= next_block[wave_id + 32];
+                    saved_c ^= next_block[wave_id + 64];
+                    saved_d ^= next_block[wave_id + 96];
+                    saved_e ^= next_block[wave_id + 128];
+                    saved_f ^= next_block[wave_id + 160];
+                    saved_g ^= next_block[wave_id + 192];
+                    saved_h ^= next_block[wave_id + 224];
+                }
 
-				tmp_a ^= tmp_c;
-				tmp_b ^= tmp_d;
+                data_a ^= saved_a;
+                data_b ^= saved_b;
+                data_c ^= saved_c;
+                data_d ^= saved_d;
+                data_e ^= saved_e;
+                data_f ^= saved_f;
+                data_g ^= saved_g;
+                data_h ^= saved_h;
 
-				next_block[id] = tmp_a;
-				next_block[id + 32] = tmp_b;
+                next_block[wave_id] = data_a;
+                next_block[wave_id + 32] = data_b;
+                next_block[wave_id + 64] = data_c;
+                next_block[wave_id + 96] = data_d;
+                next_block[wave_id + 128] = data_e;
+                next_block[wave_id + 160] = data_f;
+                next_block[wave_id + 192] = data_g;
+                next_block[wave_id + 224] = data_h;
             }
         }
 	}
 
-    local_state[i1_0_0] = tmp_a.x;
-    local_state[i1_0_1] = tmp_a.y;
-    local_state[i1_1_0] = tmp_a.z;
-    local_state[i1_1_1] = tmp_a.w;
-    local_state[i1_2_0] = tmp_b.x;
-    local_state[i1_2_1] = tmp_b.y;
-    local_state[i1_3_0] = tmp_b.z;
-    local_state[i1_3_1] = tmp_b.w;
+    local_mem[id * 8] = data_a;
+    local_mem[id * 8 + 1] = data_b;
+    local_mem[id * 8 + 2] = data_c;
+    local_mem[id * 8 + 3] = data_d;
+    local_mem[id * 8 + 4] = data_e;
+    local_mem[id * 8 + 5] = data_f;
+    local_mem[id * 8 + 6] = data_g;
+    local_mem[id * 8 + 7] = data_h;
 
     __syncthreads();
 
-	// at this point local_state will contain the final blocks
+	// at this point local_mem will contain the final blocks
 
 	if(lane == 0) { // first lane needs to acumulate results
-		tmp_a = make_uint4(0, 0, 0, 0);
-		tmp_b = make_uint4(0, 0, 0, 0);
+        data_a = make_uint4(0, 0, 0, 0);
+        data_b = make_uint4(0, 0, 0, 0);
+        data_c = make_uint4(0, 0, 0, 0);
+        data_d = make_uint4(0, 0, 0, 0);
+        data_e = make_uint4(0, 0, 0, 0);
+        data_f = make_uint4(0, 0, 0, 0);
+        data_g = make_uint4(0, 0, 0, 0);
+        data_h = make_uint4(0, 0, 0, 0);
 
+        local_mem = reinterpret_cast<uint4*>(shared + local_hash * lanes * BLOCK_SIZE_UINT);
 		for(int l=0; l<lanes; l++) {
-			uint4 *block = (uint4 *)(shared + l * BLOCK_SIZE_UINT);
-			tmp_a ^= block[id];
-			tmp_b ^= block[id + 32];
+			uint4 *block = local_mem + l * BLOCK_SIZE_UINT4;
+            data_a ^= block[id * 8];
+            data_b ^= block[id * 8 + 1];
+            data_c ^= block[id * 8 + 2];
+            data_d ^= block[id * 8 + 3];
+            data_e ^= block[id * 8 + 4];
+            data_f ^= block[id * 8 + 5];
+            data_g ^= block[id * 8 + 6];
+            data_h ^= block[id * 8 + 7];
 		}
 
-		uint4 *out_mem = (uint4 *)(out + hash * BLOCK_SIZE_UINT);
-		out_mem[id] = tmp_a;
-		out_mem[id + 32] = tmp_b;
+		uint4 *out_mem = reinterpret_cast<uint4*>(out + (base_hash + local_hash) * BLOCK_SIZE_UINT);
+        out_mem[id * 8] = data_a;
+        out_mem[id * 8 + 1] = data_b;
+        out_mem[id * 8 + 2] = data_c;
+        out_mem[id * 8 + 3] = data_d;
+        out_mem[id * 8 + 4] = data_e;
+        out_mem[id * 8 + 5] = data_f;
+        out_mem[id * 8 + 6] = data_g;
+        out_mem[id * 8 + 7] = data_h;
 	}
 };
 
-__global__ void prehash (
-        uint32_t *preseed,
-        uint32_t *seed,
-		int memsz,
-		int lanes,
-		int passes,
-		int pwdlen,
-		int saltlen,
-        int threads) { // len is given in uint32 units
+__global__ void prehash (uint32_t *scratchpad0,
+                        uint32_t *scratchpad1,
+                        uint32_t *scratchpad2,
+                        uint32_t *scratchpad3,
+                        uint32_t *scratchpad4,
+                        uint32_t *scratchpad5,
+                        uint32_t *preseed,
+                        int memsize,
+                        int memcost,
+                        int lanes,
+                        int passes,
+                        int pwdlen,
+                        int saltlen,
+                        int seg_length,
+                        int threads,
+                        int threads_per_chunk,
+                        int thread_idx) { // len is given in uint32 units
     extern __shared__ uint32_t shared[]; // size = max(lanes * 2, 8) * 88
 
 	int seeds_batch_size = blockDim.x / 4; // number of seeds per block
@@ -649,18 +438,17 @@ __global__ void prehash (
 	int thr_id = id % 4; // thread id in session
 	int session = id / 4; // blake2b hashing session
 
-    int hash = blockIdx.x * hash_batch_size;
+    int hash_base = blockIdx.x * hash_batch_size;
     int hash_idx = session / (lanes * 2);
-    hash += hash_idx;
 
-    if(hash < threads) {
+    if((hash_base + hash_idx) < threads) {
         int hash_session = session % (lanes * 2); // session in hash
 
         int lane = hash_session / 2;  // 2 lanes
         int idx = hash_session % 2; // idx in lane
 
-        uint32_t *local_mem = &shared[session * BLAKE_SHARED_MEM_UINT];
-        uint32_t *local_seed = seed + (hash * lanes * 2 + hash_session) * BLOCK_SIZE_UINT;
+        uint32_t *local_outBuff = &shared[session * BLOCK_SIZE_UINT];
+        uint32_t *local_mem = &shared[seeds_batch_size * BLOCK_SIZE_UINT + session * BLAKE_SHARED_MEM_UINT];
 
         uint64_t *h = (uint64_t *) &local_mem[20];
         uint32_t *buf = (uint32_t *) &h[10];
@@ -680,7 +468,7 @@ __global__ void prehash (
             }
 
             uint32_t nonce = (preseed[9] >> 24) | (preseed[10] << 8);
-            nonce += hash;
+            nonce += (hash_base + hash_idx);
             local_preseed[9] = (preseed[9] & 0x00FFFFFF) | (nonce << 24);
             local_preseed[10] = (preseed[10] & 0xFF000000) | (nonce >> 8);
         }
@@ -690,7 +478,7 @@ __global__ void prehash (
         buf_len = blake2b_update(value, 1, h, buf, buf_len, thr_id);
         *value = 32; //outlen
         buf_len = blake2b_update(value, 1, h, buf, buf_len, thr_id);
-        *value = memsz; //m_cost
+        *value = memcost; //m_cost
         buf_len = blake2b_update(value, 1, h, buf, buf_len, thr_id);
         *value = passes; //t_cost
         buf_len = blake2b_update(value, 1, h, buf, buf_len, thr_id);
@@ -718,8 +506,36 @@ __global__ void prehash (
             local_mem[ARGON2_PREHASH_DIGEST_LENGTH_UINT + 1] = lane;
         }
 
-        blake2b_digestLong(local_seed, ARGON2_DWORDS_IN_BLOCK, local_mem, ARGON2_PREHASH_SEED_LENGTH_UINT, thr_id,
-                           &local_mem[20]);
+        blake2b_digestLong(local_outBuff, ARGON2_DWORDS_IN_BLOCK, local_mem, ARGON2_PREHASH_SEED_LENGTH_UINT, thr_id,
+            &local_mem[20]);
+
+        int mem_hash = hash_base + thread_idx;
+        int scratchpad_location = mem_hash / threads_per_chunk;
+        uint4 *memory = reinterpret_cast<uint4*>(scratchpad0);
+        if(scratchpad_location == 1) memory = reinterpret_cast<uint4*>(scratchpad1);
+        if(scratchpad_location == 2) memory = reinterpret_cast<uint4*>(scratchpad2);
+        if(scratchpad_location == 3) memory = reinterpret_cast<uint4*>(scratchpad3);
+        if(scratchpad_location == 4) memory = reinterpret_cast<uint4*>(scratchpad4);
+        if(scratchpad_location == 5) memory = reinterpret_cast<uint4*>(scratchpad5);
+        int hash_offset = mem_hash - scratchpad_location * threads_per_chunk;
+        memory = memory + hash_offset * (memsize >> 4); // memsize / 16 -> 16 bytes in uint4
+
+        int lane_length = seg_length * 4;
+
+        uint32_t *mem_seed = shared + hash_idx * lanes * 2 * BLOCK_SIZE_UINT;
+        uint4 *seed_dst = memory + lane * (lane_length * 4) * BLOCK_SIZE_UINT4; // lane_length * 4 because we intercalate 4 hashes in memory
+        uint4 *seed_src = reinterpret_cast<uint4*>(mem_seed + lane * 2 * BLOCK_SIZE_UINT);
+
+        int thr_in_lane = threadIdx.x % THREADS_PER_LANE;
+
+        for(int i=0; i < 8; i++)
+        seed_dst[id + i * 32] = seed_src[i + thr_in_lane * 8]; // id * 8 - split the block in 8 succesive regions of 8 uint4 each
+
+        seed_src += BLOCK_SIZE_UINT4;
+        seed_dst += (4 * BLOCK_SIZE_UINT4);
+
+        for(int i=0; i < 8; i++)
+        seed_dst[id + i * 32] = seed_src[i + thr_in_lane * 8];
     }
 }
 
@@ -1059,15 +875,24 @@ bool cuda_kernel_prehasher(void *memory, int threads, Argon2Profile *profile, vo
         return false;
     }
 
-	prehash <<< ceil(threads / hashes_per_block), work_items, sessions * BLAKE_SHARED_MEM, stream>>> (
+	prehash <<< ceil(threads / hashes_per_block), work_items, sessions * (BLAKE_SHARED_MEM + ARGON2_BLOCK_SIZE), stream>>> (
+            (uint32_t*)device->arguments.memoryChunk_0,
+            (uint32_t*)device->arguments.memoryChunk_1,
+            (uint32_t*)device->arguments.memoryChunk_2,
+            (uint32_t*)device->arguments.memoryChunk_3,
+            (uint32_t*)device->arguments.memoryChunk_4,
+            (uint32_t*)device->arguments.memoryChunk_5,
 			device->arguments.preseedMemory[gpumgmt_thread->threadId],
-			device->arguments.seedMemory[gpumgmt_thread->threadId],
-			profile->memCost,
+            profile->memSize,
+            profile->memCost,
 			profile->thrCost,
 			profile->segCount / (4 * profile->thrCost),
             gpumgmt_thread->hashData.inSize / 4,
 			profile->saltLen,
-            threads);
+            profile->segSize,
+            threads,
+            device->profileInfo.threads_per_chunk,
+            gpumgmt_thread->threadsIdx);
 
     return true;
 }
@@ -1078,15 +903,14 @@ void *cuda_kernel_filler(int threads, Argon2Profile *profile, void *user_data) {
 	cudaStream_t stream = (cudaStream_t)gpumgmt_thread->deviceData;
 
     size_t work_items = KERNEL_WORKGROUP_SIZE * profile->thrCost;
-    size_t shared_mem = profile->thrCost * (ARGON2_BLOCK_SIZE + 128 + (profile->succesiveIdxs == 1 ? 128 : 0));
+    size_t shared_mem = profile->thrCost * (4 * ARGON2_BLOCK_SIZE + 128 + (profile->succesiveIdxs == 1 ? 128 : 0));
 
-	fill_blocks <<<threads, work_items, shared_mem, stream>>> ((uint32_t*)device->arguments.memoryChunk_0,
+	fill_blocks <<<threads / 4, work_items, shared_mem, stream>>> ((uint32_t*)device->arguments.memoryChunk_0,
 			(uint32_t*)device->arguments.memoryChunk_1,
 			(uint32_t*)device->arguments.memoryChunk_2,
 			(uint32_t*)device->arguments.memoryChunk_3,
 			(uint32_t*)device->arguments.memoryChunk_4,
 			(uint32_t*)device->arguments.memoryChunk_5,
-			device->arguments.seedMemory[gpumgmt_thread->threadId],
 			device->arguments.outMemory[gpumgmt_thread->threadId],
 			device->arguments.refs,
 			device->arguments.idxs,

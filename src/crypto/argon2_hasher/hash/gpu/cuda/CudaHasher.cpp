@@ -228,7 +228,7 @@ void CudaHasher::cleanup() {
 }
 
 bool CudaHasher::setupDeviceInfo(CudaDeviceInfo *device, double intensity) {
-    device->profileInfo.threads_per_chunk = (uint32_t)(device->maxAllocableMemSize / device->profileInfo.profile->memSize);
+    device->profileInfo.threads_per_chunk = (((uint32_t)(device->maxAllocableMemSize / device->profileInfo.profile->memSize)) / 4) * 4; // threads per chunk needs to be divisible by 4 to allow wavefront to work on the same chunk
     size_t chunk_size = device->profileInfo.threads_per_chunk * device->profileInfo.profile->memSize;
 
     if(chunk_size == 0) {
@@ -249,9 +249,9 @@ bool CudaHasher::setupDeviceInfo(CudaDeviceInfo *device, double intensity) {
     }
 
     device->profileInfo.threads = (uint32_t)(max_threads * intensity / 100.0);
-	device->profileInfo.threads = (device->profileInfo.threads / 2) * 2; // make it divisible by 2 to allow for parallel kernel execution
+	device->profileInfo.threads = (device->profileInfo.threads / 8) * 8; // make it divisible by 8 to allow for parallel kernel execution and 4 hashes/wavefront
 	if(max_threads > 0 && device->profileInfo.threads == 0 && intensity > 0)
-        device->profileInfo.threads = 2;
+        device->profileInfo.threads = 8;
 
     chunks = (double)device->profileInfo.threads / (double)device->profileInfo.threads_per_chunk;
 
@@ -274,7 +274,8 @@ bool CudaHasher::buildThreadData() {
             thread_data.threadId = threadId;
 
             cudaStream_t stream;
-            cudaSetDevice(device->cudaIndex);		
+            cudaSetDevice(device->cudaIndex);
+            cudaDeviceSetCacheConfig(cudaFuncCachePreferL1);
             device->error = cudaStreamCreate(&stream);
             if(device->error != cudaSuccess) {
                 LOG("Error running kernel: (" + to_string(device->error) + ") cannot create cuda stream.");
@@ -286,10 +287,10 @@ bool CudaHasher::buildThreadData() {
             #ifdef PARALLEL_CUDA
                 if(threadId == 0) {
                     thread_data.threadsIdx = 0;
-                    thread_data.threads = device->profileInfo.threads / 2;
+                    thread_data.threads = 4 * (device->profileInfo.threads / 8); // keep it divisible by 4
                 }
                 else {
-                    thread_data.threadsIdx = device->profileInfo.threads / 2;
+                    thread_data.threadsIdx = 4 * (device->profileInfo.threads / 8);
                     thread_data.threads = device->profileInfo.threads - thread_data.threadsIdx;
                 }
             #else
