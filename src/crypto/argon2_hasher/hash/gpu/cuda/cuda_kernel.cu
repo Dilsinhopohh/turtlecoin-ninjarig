@@ -10,131 +10,79 @@
 #include "CudaHasher.h"
 
 #define THREADS_PER_LANE               32
-#define BLOCK_SIZE_UINT4                64
+#define BLOCK_SIZE_ULONG4              32
 #define BLOCK_SIZE_UINT                256
+#define BLOCK_SIZE_ULONG               128
 #define KERNEL_WORKGROUP_SIZE   		32
 #define ARGON2_PREHASH_DIGEST_LENGTH_UINT   16
 #define ARGON2_PREHASH_SEED_LENGTH_UINT     18
 
-
 #include "blake2b.cu"
 
-#define COMPUTE	\
-	asm ("{"	\
-		".reg .u32 s1, s2, s3, s4;\n\t"	\
-		"mul.lo.u32 s3, %0, %2;\n\t"	\
-		"mul.hi.u32 s4, %0, %2;\n\t"	\
-		"add.cc.u32 s3, s3, s3;\n\t"	\
-		"addc.u32 s4, s4, s4;\n\t"	\
-		"add.cc.u32 s1, %0, %2;\n\t"	\
-		"addc.u32 s2, %1, %3;\n\t"	\
-		"add.cc.u32 %0, s1, s3;\n\t"	\
-		"addc.u32 %1, s2, s4;\n\t"	\
-		"xor.b32 s1, %0, %6;\n\t"	\
-		"xor.b32 %6, %1, %7;\n\t"	\
-		"mov.b32 %7, s1;\n\t"	\
-		"mul.lo.u32 s3, %4, %6;\n\t"	\
-		"mul.hi.u32 s4, %4, %6;\n\t"	\
-		"add.cc.u32 s3, s3, s3;\n\t"	\
-		"addc.u32 s4, s4, s4;\n\t"	\
-		"add.cc.u32 s1, %4, %6;\n\t"	\
-		"addc.u32 s2, %5, %7;\n\t"	\
-		"add.cc.u32 %4, s1, s3;\n\t"	\
-		"addc.u32 %5, s2, s4;\n\t"	\
-		"xor.b32 s3, %2, %4;\n\t"	\
-		"xor.b32 s4, %3, %5;\n\t"	\
-		"shf.r.wrap.b32 %3, s4, s3, 24;\n\t"	\
-		"shf.r.wrap.b32 %2, s3, s4, 24;\n\t"	\
-		"mul.lo.u32 s3, %0, %2;\n\t"	\
-		"mul.hi.u32 s4, %0, %2;\n\t"	\
-		"add.cc.u32 s3, s3, s3;\n\t"	\
-		"addc.u32 s4, s4, s4;\n\t"	\
-		"add.cc.u32 s1, %0, %2;\n\t"	\
-		"addc.u32 s2, %1, %3;\n\t"	\
-		"add.cc.u32 %0, s1, s3;\n\t"	\
-		"addc.u32 %1, s2, s4;\n\t"	\
-		"xor.b32 s3, %0, %6;\n\t"	\
-		"xor.b32 s4, %1, %7;\n\t"	\
-		"shf.r.wrap.b32 %7, s4, s3, 16;\n\t"	\
-		"shf.r.wrap.b32 %6, s3, s4, 16;\n\t"	\
-		"mul.lo.u32 s3, %4, %6;\n\t"	\
-		"mul.hi.u32 s4, %4, %6;\n\t"	\
-		"add.cc.u32 s3, s3, s3;\n\t"	\
-		"addc.u32 s4, s4, s4;\n\t"	\
-		"add.cc.u32 s1, %4, %6;\n\t"	\
-		"addc.u32 s2, %5, %7;\n\t"	\
-		"add.cc.u32 %4, s1, s3;\n\t"	\
-		"addc.u32 %5, s2, s4;\n\t"	\
-		"xor.b32 s3, %2, %4;\n\t"	\
-		"xor.b32 s4, %3, %5;\n\t"	\
-		"shf.r.wrap.b32 %3, s3, s4, 31;\n\t"	\
-		"shf.r.wrap.b32 %2, s4, s3, 31;\n\t"	\
-	"}" : "+r"(tmp_a.x), "+r"(tmp_a.y), "+r"(tmp_a.z), "+r"(tmp_a.w), "+r"(tmp_b.x), "+r"(tmp_b.y), "+r"(tmp_b.z), "+r"(tmp_b.w));
+__device__ uint64_t upsample(uint32_t hi, uint32_t lo)
+{
+    return ((uint64_t)hi << 32) | (uint64_t)lo;
+}
+
+__device__ uint64_t rotate(uint64_t x, uint32_t n)
+{
+    return (x >> (64-n)) | (x << n);
+}
+
+#define fBlaMka(x, y) ((x) + (y) + 2 * upsample(__umulhi((uint32_t)(x), (uint32_t)(y)), (uint32_t)(x) * (uint32_t)y))
+
+#define COMPUTE(a, b, c, d) \
+    a = fBlaMka(a, b);          \
+    d = rotate(d ^ a, 32);      \
+    c = fBlaMka(c, d);          \
+    b = rotate(b ^ c, 40);      \
+    a = fBlaMka(a, b);          \
+    d = rotate(d ^ a, 48);      \
+    c = fBlaMka(c, d);          \
+    b = rotate(b ^ c, 1);       \
 
 #define G1(data)           \
 {                           \
-	COMPUTE \
-	tmp_a.z = __shfl_sync(0xffffffff, tmp_a.z, i_shfl1_1); \
-	tmp_a.w = __shfl_sync(0xffffffff, tmp_a.w, i_shfl1_1); \
-	tmp_b.x = __shfl_sync(0xffffffff, tmp_b.x, i_shfl1_2); \
-	tmp_b.y = __shfl_sync(0xffffffff, tmp_b.y, i_shfl1_2); \
-	tmp_b.z = __shfl_sync(0xffffffff, tmp_b.z, i_shfl1_3); \
-	tmp_b.w = __shfl_sync(0xffffffff, tmp_b.w, i_shfl1_3); \
+	COMPUTE(tmp_a.x, tmp_a.y, tmp_a.z, tmp_a.w) \
+	tmp_a.y = __shfl_sync(0xffffffff, tmp_a.y, i_shfl1_1); \
+	tmp_a.z = __shfl_sync(0xffffffff, tmp_a.z, i_shfl1_2); \
+	tmp_a.w = __shfl_sync(0xffffffff, tmp_a.w, i_shfl1_3); \
 }
 
 #define G2(data)           \
 { \
-	COMPUTE \
+	COMPUTE(tmp_a.x, tmp_a.y, tmp_a.z, tmp_a.w) \
     data[i2_0_0] = tmp_a.x; \
-    data[i2_0_1] = tmp_a.y; \
-    data[i2_1_0] = tmp_a.z; \
-    data[i2_1_1] = tmp_a.w; \
-    data[i2_2_0] = tmp_b.x; \
-    data[i2_2_1] = tmp_b.y; \
-    data[i2_3_0] = tmp_b.z; \
-    data[i2_3_1] = tmp_b.w; \
+    data[i2_1_0] = tmp_a.y; \
+    data[i2_2_0] = tmp_a.z; \
+    data[i2_3_0] = tmp_a.w; \
     __syncwarp(); \
 }
 
 #define G3(data)           \
 {                           \
     tmp_a.x = data[i3_0_0]; \
-    tmp_a.y = data[i3_0_1]; \
-    tmp_a.z = data[i3_1_0]; \
-    tmp_a.w = data[i3_1_1]; \
-    tmp_b.x = data[i3_2_0]; \
-    tmp_b.y = data[i3_2_1]; \
-    tmp_b.z = data[i3_3_0]; \
-    tmp_b.w = data[i3_3_1]; \
-	COMPUTE \
-	tmp_a.z = __shfl_sync(0xffffffff, tmp_a.z, i_shfl2_1); \
-	tmp_a.w = __shfl_sync(0xffffffff, tmp_a.w, i_shfl2_1); \
-	tmp_b.x = __shfl_sync(0xffffffff, tmp_b.x, i_shfl2_2); \
-	tmp_b.y = __shfl_sync(0xffffffff, tmp_b.y, i_shfl2_2); \
-	tmp_b.z = __shfl_sync(0xffffffff, tmp_b.z, i_shfl2_3); \
-	tmp_b.w = __shfl_sync(0xffffffff, tmp_b.w, i_shfl2_3); \
+    tmp_a.y = data[i3_1_0]; \
+    tmp_a.z = data[i3_2_0]; \
+    tmp_a.w = data[i3_3_0]; \
+	COMPUTE(tmp_a.x, tmp_a.y, tmp_a.z, tmp_a.w) \
+	tmp_a.y = __shfl_sync(0xffffffff, tmp_a.y, i_shfl2_1); \
+	tmp_a.z = __shfl_sync(0xffffffff, tmp_a.z, i_shfl2_2); \
+	tmp_a.w = __shfl_sync(0xffffffff, tmp_a.w, i_shfl2_3); \
 }
 
 #define G4(data)           \
 {                           \
-	COMPUTE \
+	COMPUTE(tmp_a.x, tmp_a.y, tmp_a.z, tmp_a.w) \
     data[i4_0_0] = tmp_a.x; \
-    data[i4_0_1] = tmp_a.y; \
-    data[i4_1_0] = tmp_a.z; \
-    data[i4_1_1] = tmp_a.w; \
-    data[i4_2_0] = tmp_b.x; \
-    data[i4_2_1] = tmp_b.y; \
-    data[i4_3_0] = tmp_b.z; \
-    data[i4_3_1] = tmp_b.w; \
+    data[i4_1_0] = tmp_a.y; \
+    data[i4_2_0] = tmp_a.z; \
+    data[i4_3_0] = tmp_a.w; \
     __syncwarp(); \
     tmp_a.x = data[i1_0_0]; \
-    tmp_a.y = data[i1_0_1]; \
-    tmp_a.z = data[i1_1_0]; \
-    tmp_a.w = data[i1_1_1]; \
-    tmp_b.x = data[i1_2_0]; \
-    tmp_b.y = data[i1_2_1]; \
-    tmp_b.z = data[i1_3_0]; \
-    tmp_b.w = data[i1_3_1]; \
+    tmp_a.y = data[i1_1_0]; \
+    tmp_a.z = data[i1_2_0]; \
+    tmp_a.w = data[i1_3_0]; \
 }
 
 __constant__ int offsets[768] = {
@@ -332,7 +280,7 @@ __constant__ int offsets[768] = {
         31, 14, 15, 30
 };
 
-inline __host__ __device__ void operator^=( uint4& a, uint4 s) {
+inline __host__ __device__ void operator^=( ulong4& a, ulong4 s) {
    a.x ^= s.x; a.y ^= s.y; a.z ^= s.z; a.w ^= s.w;
 }
 
@@ -353,13 +301,13 @@ __global__ void fill_blocks(uint32_t *scratchpad0,
                             int seg_count,
 							int threads_per_chunk,
 							int thread_idx) {
-    extern __shared__ uint32_t shared[]; // lanes * BLOCK_SIZE_UINT [local state] + lanes * 32 [refs buffer] ( + lanes * 32 [idx buffer])
+    extern __shared__ uint64_t shared[]; // lanes * BLOCK_SIZE_UINT [local state] + lanes * 32 [refs buffer] ( + lanes * 32 [idx buffer])
 
-	uint32_t *local_state = shared;
-	uint32_t *local_refs = shared + (lanes * BLOCK_SIZE_UINT);
-	uint32_t *local_idxs = shared + (lanes * BLOCK_SIZE_UINT + lanes * 32);
+	uint64_t *local_state = shared;
+	uint32_t *local_refs = ((uint32_t*)shared) + (lanes * BLOCK_SIZE_UINT);
+	uint32_t *local_idxs = ((uint32_t*)shared) + (lanes * BLOCK_SIZE_UINT + lanes * 32);
 
-	uint4 tmp_a, tmp_b, tmp_c, tmp_d, tmp_p, tmp_q, tmp_l, tmp_m;
+	ulong4 tmp_a, tmp_c, tmp_p, tmp_l;
 
 	int hash = blockIdx.x;
 	int mem_hash = hash + thread_idx;
@@ -371,41 +319,25 @@ __global__ void fill_blocks(uint32_t *scratchpad0,
 
 	int offset = id << 2;
 
-	int i1_0_0 = 2 * offsets[offset];
-	int i1_0_1 = i1_0_0 + 1;
-	int i1_1_0 = 2 * offsets[offset + 1];
-	int i1_1_1 = i1_1_0 + 1;
-	int i1_2_0 = 2 * offsets[offset + 2];
-	int i1_2_1 = i1_2_0 + 1;
-	int i1_3_0 = 2 * offsets[offset + 3];
-	int i1_3_1 = i1_3_0 + 1;
+	int i1_0_0 = offsets[offset];
+	int i1_1_0 = offsets[offset + 1];
+	int i1_2_0 = offsets[offset + 2];
+	int i1_3_0 = offsets[offset + 3];
 
-	int i2_0_0 = 2 * offsets[offset + 128];
-	int i2_0_1 = i2_0_0 + 1;
-	int i2_1_0 = 2 * offsets[offset + 129];
-	int i2_1_1 = i2_1_0 + 1;
-	int i2_2_0 = 2 * offsets[offset + 130];
-	int i2_2_1 = i2_2_0 + 1;
-	int i2_3_0 = 2 * offsets[offset + 131];
-	int i2_3_1 = i2_3_0 + 1;
+	int i2_0_0 = offsets[offset + 128];
+	int i2_1_0 = offsets[offset + 129];
+	int i2_2_0 = offsets[offset + 130];
+	int i2_3_0 = offsets[offset + 131];
 
-	int i3_0_0 = 2 * offsets[offset + 256];
-	int i3_0_1 = i3_0_0 + 1;
-	int i3_1_0 = 2 * offsets[offset + 257];
-	int i3_1_1 = i3_1_0 + 1;
-	int i3_2_0 = 2 * offsets[offset + 258];
-	int i3_2_1 = i3_2_0 + 1;
-	int i3_3_0 = 2 * offsets[offset + 259];
-	int i3_3_1 = i3_3_0 + 1;
+	int i3_0_0 = offsets[offset + 256];
+	int i3_1_0 = offsets[offset + 257];
+	int i3_2_0 = offsets[offset + 258];
+	int i3_3_0 = offsets[offset + 259];
 
-	int i4_0_0 = 2 * offsets[offset + 384];
-	int i4_0_1 = i4_0_0 + 1;
-	int i4_1_0 = 2 * offsets[offset + 385];
-	int i4_1_1 = i4_1_0 + 1;
-	int i4_2_0 = 2 * offsets[offset + 386];
-	int i4_2_1 = i4_2_0 + 1;
-	int i4_3_0 = 2 * offsets[offset + 387];
-	int i4_3_1 = i4_3_0 + 1;
+	int i4_0_0 = offsets[offset + 384];
+	int i4_1_0 = offsets[offset + 385];
+	int i4_2_0 = offsets[offset + 386];
+	int i4_3_0 = offsets[offset + 387];
 
 	int i_shfl1_1 = offsets[offset + 513];
 	int i_shfl1_2 = offsets[offset + 514];
@@ -415,33 +347,31 @@ __global__ void fill_blocks(uint32_t *scratchpad0,
 	int i_shfl2_3 = offsets[offset + 643];
 
     int scratchpad_location = mem_hash / threads_per_chunk;
-    uint4 *memory = reinterpret_cast<uint4*>(scratchpad0);
-    if(scratchpad_location == 1) memory = reinterpret_cast<uint4*>(scratchpad1);
-    if(scratchpad_location == 2) memory = reinterpret_cast<uint4*>(scratchpad2);
-    if(scratchpad_location == 3) memory = reinterpret_cast<uint4*>(scratchpad3);
-    if(scratchpad_location == 4) memory = reinterpret_cast<uint4*>(scratchpad4);
-    if(scratchpad_location == 5) memory = reinterpret_cast<uint4*>(scratchpad5);
+    ulong4 *memory = reinterpret_cast<ulong4*>(scratchpad0);
+    if(scratchpad_location == 1) memory = reinterpret_cast<ulong4*>(scratchpad1);
+    if(scratchpad_location == 2) memory = reinterpret_cast<ulong4*>(scratchpad2);
+    if(scratchpad_location == 3) memory = reinterpret_cast<ulong4*>(scratchpad3);
+    if(scratchpad_location == 4) memory = reinterpret_cast<ulong4*>(scratchpad4);
+    if(scratchpad_location == 5) memory = reinterpret_cast<ulong4*>(scratchpad5);
     int hash_offset = mem_hash - scratchpad_location * threads_per_chunk;
-    memory = memory + hash_offset * (memsize >> 4); // memsize / 16 -> 16 bytes in uint4
+    memory = memory + hash_offset * (memsize >> 5); // memsize / 16 -> 16 bytes in uint4
 
 	uint32_t *mem_seed = seed + hash * lanes * 2 * BLOCK_SIZE_UINT;
 
-	uint32_t *seed_src = mem_seed + lane * 2 * BLOCK_SIZE_UINT;
-	uint4 *seed_dst = memory + lane * lane_length * BLOCK_SIZE_UINT4;
+	uint64_t *seed_src = reinterpret_cast<uint64_t *>(mem_seed + lane * 2 * BLOCK_SIZE_UINT);
+	ulong4 *seed_dst = memory + lane * lane_length * BLOCK_SIZE_ULONG4;
 
-	seed_dst[id] = make_uint4(seed_src[i1_0_0], seed_src[i1_0_1], seed_src[i1_1_0], seed_src[i1_1_1]);
-	seed_dst[id + 32] = make_uint4(seed_src[i1_2_0], seed_src[i1_2_1], seed_src[i1_3_0], seed_src[i1_3_1]);
-	seed_src += BLOCK_SIZE_UINT;
-	seed_dst += BLOCK_SIZE_UINT4;
-	seed_dst[id] = make_uint4(seed_src[i1_0_0], seed_src[i1_0_1], seed_src[i1_1_0], seed_src[i1_1_1]);
-	seed_dst[id + 32] = make_uint4(seed_src[i1_2_0], seed_src[i1_2_1], seed_src[i1_3_0], seed_src[i1_3_1]);
+	seed_dst[id] = make_ulong4(seed_src[i1_0_0], seed_src[i1_1_0], seed_src[i1_2_0], seed_src[i1_3_0]);
+	seed_src += BLOCK_SIZE_ULONG;
+	seed_dst += BLOCK_SIZE_ULONG4;
+    seed_dst[id] = make_ulong4(seed_src[i1_0_0], seed_src[i1_1_0], seed_src[i1_2_0], seed_src[i1_3_0]);
 
-	uint4 *next_block;
-	uint4 *prev_block;
-	uint4 *ref_block;
+	ulong4 *next_block;
+	ulong4 *prev_block;
+	ulong4 *ref_block;
     uint32_t *seg_refs, *seg_idxs;
 
-	local_state = local_state + lane * BLOCK_SIZE_UINT;
+	local_state = local_state + lane * BLOCK_SIZE_ULONG;
 	local_refs = local_refs + lane * 32;
 	local_idxs = local_idxs + lane * 32;
 
@@ -461,10 +391,9 @@ __global__ void fill_blocks(uint32_t *scratchpad0,
         uint32_t seg_type = cur_seg[2];
         uint32_t ref_idx = 0;
 
-        prev_block = memory + prev_idx * BLOCK_SIZE_UINT4;
+        prev_block = memory + prev_idx * BLOCK_SIZE_ULONG4;
 
         tmp_a = prev_block[id];
-        tmp_b = prev_block[id + 32];
 
         __syncthreads();
 
@@ -473,7 +402,7 @@ __global__ void fill_blocks(uint32_t *scratchpad0,
             if(idxs != NULL) seg_idxs = idxs + ((s * lanes + lane) * seg_length - ((s > 0) ? lanes : lane) * 2);
 
             for (cur_idx--;idx < seg_length; seg_refs += 32, seg_idxs += 32) {
-				uint64_t i_limit = seg_length - idx;
+				uint32_t i_limit = seg_length - idx;
 				if (i_limit > 32) i_limit = 32;
 
 				local_refs[id] = seg_refs[id];
@@ -487,19 +416,15 @@ __global__ void fill_blocks(uint32_t *scratchpad0,
 				} else
 				    cur_idx++;
 
-                ref_block = memory + ref_idx * BLOCK_SIZE_UINT4;
+                ref_block = memory + ref_idx * BLOCK_SIZE_ULONG4;
                 tmp_p = ref_block[id];
-                tmp_q = ref_block[id + 32];
 
                 for (int i = 0; i < i_limit; i++, idx++) {
-                    next_block = memory + cur_idx * BLOCK_SIZE_UINT4;
-					if(with_xor == 1) {
+                    next_block = memory + cur_idx * BLOCK_SIZE_ULONG4;
+					if(with_xor == 1)
 						tmp_l = next_block[id];
-						tmp_m = next_block[id + 32];
-					}
 
 					tmp_a ^= tmp_p;
-                    tmp_b ^= tmp_q;
 
                     if (i < (i_limit - 1)) {
 						ref_idx = local_refs[i + 1];
@@ -512,30 +437,24 @@ __global__ void fill_blocks(uint32_t *scratchpad0,
 						else
 							cur_idx++;
 
-                        ref_block = memory + ref_idx * BLOCK_SIZE_UINT4;
+                        ref_block = memory + ref_idx * BLOCK_SIZE_ULONG4;
                         tmp_p = ref_block[id];
-                        tmp_q = ref_block[id + 32];
                     }
 
 					tmp_c = tmp_a;
-					tmp_d = tmp_b;
 
 					G1(local_state);
                     G2(local_state);
                     G3(local_state);
                     G4(local_state);
 
-                    if(with_xor == 1) {
+                    if(with_xor == 1)
 						tmp_c ^= tmp_l;
-						tmp_d ^= tmp_m;
-					}
 
                     tmp_a ^= tmp_c;
-                    tmp_b ^= tmp_d;
 
                     if(keep > 0) {
 						next_block[id] = tmp_a;
-						next_block[id + 32] = tmp_b;
 					}
                 }
             }
@@ -543,15 +462,14 @@ __global__ void fill_blocks(uint32_t *scratchpad0,
         else {
 
             for (; idx < seg_length; idx++, cur_idx++) {
-				next_block = memory + cur_idx * BLOCK_SIZE_UINT4;
+				next_block = memory + cur_idx * BLOCK_SIZE_ULONG4;
 
-				if(with_xor == 1) {
+				if(with_xor == 1)
 					tmp_l = next_block[id];
-					tmp_m = next_block[id + 32];
-				}
 
-				uint32_t pseudo_rand_lo = __shfl_sync(0xffffffff, tmp_a.x, 0);
-				uint32_t pseudo_rand_hi = __shfl_sync(0xffffffff, tmp_a.y, 0);
+                uint64_t pseudo_rand = __shfl_sync(0xffffffff, tmp_a.x, 0);
+                uint32_t pseudo_rand_lo = (uint32_t) pseudo_rand;
+				uint32_t pseudo_rand_hi = pseudo_rand >> 32;
 
 				uint64_t ref_lane = pseudo_rand_hi % lanes; // thr_cost
 				uint32_t reference_area_size = 0;
@@ -575,59 +493,46 @@ __global__ void fill_blocks(uint32_t *scratchpad0,
 
 				ref_idx = ref_lane * lane_length + (((pass > 0 && slice < 3) ? ((slice + 1) * seg_length) : 0) + relative_position) % lane_length;
 
-				ref_block = memory + ref_idx * BLOCK_SIZE_UINT4;
+				ref_block = memory + ref_idx * BLOCK_SIZE_ULONG4;
 
 				tmp_a ^= ref_block[id];
-				tmp_b ^= ref_block[id + 32];
 
 				tmp_c = tmp_a;
-				tmp_d = tmp_b;
 
 				G1(local_state);
 				G2(local_state);
 				G3(local_state);
 				G4(local_state);
 
-				if(with_xor == 1) {
+				if(with_xor == 1)
 					tmp_c ^= tmp_l;
-					tmp_d ^= tmp_m;
-				}
 
 				tmp_a ^= tmp_c;
-				tmp_b ^= tmp_d;
 
 				next_block[id] = tmp_a;
-				next_block[id + 32] = tmp_b;
             }
         }
 	}
 
     local_state[i1_0_0] = tmp_a.x;
-    local_state[i1_0_1] = tmp_a.y;
-    local_state[i1_1_0] = tmp_a.z;
-    local_state[i1_1_1] = tmp_a.w;
-    local_state[i1_2_0] = tmp_b.x;
-    local_state[i1_2_1] = tmp_b.y;
-    local_state[i1_3_0] = tmp_b.z;
-    local_state[i1_3_1] = tmp_b.w;
+    local_state[i1_1_0] = tmp_a.y;
+    local_state[i1_2_0] = tmp_a.z;
+    local_state[i1_3_0] = tmp_a.w;
 
     __syncthreads();
 
 	// at this point local_state will contain the final blocks
 
 	if(lane == 0) { // first lane needs to acumulate results
-		tmp_a = make_uint4(0, 0, 0, 0);
-		tmp_b = make_uint4(0, 0, 0, 0);
+		tmp_a = make_ulong4(0, 0, 0, 0);
 
 		for(int l=0; l<lanes; l++) {
-			uint4 *block = (uint4 *)(shared + l * BLOCK_SIZE_UINT);
+			ulong4 *block = (ulong4 *)(shared + l * BLOCK_SIZE_ULONG);
 			tmp_a ^= block[id];
-			tmp_b ^= block[id + 32];
 		}
 
-		uint4 *out_mem = (uint4 *)(out + hash * BLOCK_SIZE_UINT);
+		ulong4 *out_mem = (ulong4 *)(out + hash * BLOCK_SIZE_UINT);
 		out_mem[id] = tmp_a;
-		out_mem[id + 32] = tmp_b;
 	}
 };
 
@@ -640,7 +545,7 @@ __global__ void prehash (
 		int pwdlen,
 		int saltlen,
         int threads) { // len is given in uint32 units
-    extern __shared__ uint32_t shared[]; // size = max(lanes * 2, 8) * 88
+    extern __shared__ uint64_t shared[]; // size = max(lanes * 2, 8) * 88
 
 	int seeds_batch_size = blockDim.x / 4; // number of seeds per block
 	int hash_batch_size = seeds_batch_size / (lanes * 2); // number of hashes per block
@@ -659,7 +564,7 @@ __global__ void prehash (
         int lane = hash_session / 2;  // 2 lanes
         int idx = hash_session % 2; // idx in lane
 
-        uint32_t *local_mem = &shared[session * BLAKE_SHARED_MEM_UINT];
+        uint32_t *local_mem = (uint32_t *)&shared[session * BLAKE_SHARED_MEM_UINT / 2];
         uint32_t *local_seed = seed + (hash * lanes * 2 + hash_session) * BLOCK_SIZE_UINT;
 
         uint64_t *h = (uint64_t *) &local_mem[20];
@@ -727,7 +632,7 @@ __global__ void posthash (
         uint32_t *hash,
         uint32_t *out,
         uint32_t *preseed) {
-    extern __shared__ uint32_t shared[]; // size = 120
+    extern __shared__ uint64_t shared[]; // size = 120
 
     int hash_id = blockIdx.x;
     int thread = threadIdx.x;
@@ -735,7 +640,7 @@ __global__ void posthash (
     uint32_t *local_hash = hash + hash_id * ((ARGON2_RAW_LENGTH / 4) + 1);
     uint32_t *local_out = out + hash_id * BLOCK_SIZE_UINT;
 
-    blake2b_digestLong(local_hash, ARGON2_RAW_LENGTH / 4, local_out, ARGON2_DWORDS_IN_BLOCK, thread, shared);
+    blake2b_digestLong(local_hash, ARGON2_RAW_LENGTH / 4, local_out, ARGON2_DWORDS_IN_BLOCK, thread, (uint32_t *)shared);
 
     if(thread == 0) {
         uint32_t nonce = (preseed[9] >> 24) | (preseed[10] << 8);
@@ -1120,10 +1025,7 @@ bool cuda_kernel_posthasher(void *memory, int threads, Argon2Profile *profile, v
 		return false;
 	}
 
-	while(cudaStreamQuery(stream) != cudaSuccess) {
-		this_thread::sleep_for(chrono::milliseconds(10));
-		continue;
-	}
+    cudaStreamSynchronize(stream);
 
     memcpy(memory, device->arguments.hostSeedMemory[gpumgmt_thread->threadId], threads * (xmrig::ARGON2_HASHLEN + 4));
 	gpumgmt_thread->unlock();
