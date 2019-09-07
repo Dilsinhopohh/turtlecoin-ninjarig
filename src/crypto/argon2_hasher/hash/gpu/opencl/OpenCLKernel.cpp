@@ -548,7 +548,7 @@ void blake2b_digestLong_local(__global uint *out, int out_len,
 
 #define fBlaMka(x, y) ((x) + (y) + 2 * upsample(mul_hi((uint)(x), (uint)(y)), (uint)(x) * (uint)y))
 
-#define COMPUTE \
+#define COMPUTE(a, b, c, d) \
     a = fBlaMka(a, b);          \
     d = rotr64(d ^ a, (ulong)32);      \
     c = fBlaMka(c, d);          \
@@ -698,57 +698,56 @@ __constant char offsets_round_4[32][4] = {
         { 31, 46, 79, 126 },
 };
 
-#define G1(data) \
+#define G1(data, a, b, c, d) \
 { \
-	barrier(CLK_LOCAL_MEM_FENCE); \
-	a = data[i1_0]; \
-	b = data[i1_1]; \
-	c = data[i1_2]; \
-	d = data[i1_3]; \
-	COMPUTE \
+	COMPUTE(a, b, c, d) \
 	data[i1_1] = b; \
     data[i1_2] = c; \
     data[i1_3] = d; \
     barrier(CLK_LOCAL_MEM_FENCE); \
-}
-
-#define G2(data) \
-{ \
 	b = data[i2_1]; \
 	c = data[i2_2]; \
 	d = data[i2_3]; \
-	COMPUTE \
+}
+
+#define G2(data, a, b, c, d) \
+{ \
+	COMPUTE(a, b, c, d) \
 	data[i2_0] = a; \
 	data[i2_1] = b; \
     data[i2_2] = c; \
     data[i2_3] = d; \
     barrier(CLK_LOCAL_MEM_FENCE); \
-}
-
-#define G3(data) \
-{ \
 	a = data[i3_0]; \
 	b = data[i3_1]; \
 	c = data[i3_2]; \
 	d = data[i3_3]; \
-	COMPUTE \
+}
+
+#define G3(data, a, b, c, d) \
+{ \
+	COMPUTE(a, b, c, d) \
 	data[i3_1] = b; \
     data[i3_2] = c; \
     data[i3_3] = d; \
     barrier(CLK_LOCAL_MEM_FENCE); \
-}
-
-#define G4(data) \
-{ \
 	b = data[i4_1]; \
 	c = data[i4_2]; \
 	d = data[i4_3]; \
-	COMPUTE \
+}
+
+#define G4(data, a, b, c, d) \
+{ \
+	COMPUTE(a, b, c, d) \
 	data[i4_0] = a; \
 	data[i4_1] = b; \
     data[i4_2] = c; \
     data[i4_3] = d; \
     barrier(CLK_LOCAL_MEM_FENCE); \
+	a = data[i1_0]; \
+	b = data[i1_1]; \
+	c = data[i1_2]; \
+	d = data[i1_3]; \
 }
 
 __kernel void fill_blocks(__global ulong *chunk_0,
@@ -769,8 +768,7 @@ __kernel void fill_blocks(__global ulong *chunk_0,
 						int threads_per_chunk,
                         int thread_idx,
                         __local ulong *scratchpad) { // lanes * BLOCK_SIZE_ULONG
-    ulong4 tmp;
-	ulong a, b, c, d;
+    ulong4 data, save;
 
 	int hash_base = get_group_id(0) * 2;
 	int mem_hash = hash_base + thread_idx;
@@ -818,12 +816,12 @@ __kernel void fill_blocks(__global ulong *chunk_0,
 	__global ulong *seed_mem = seed + hash * lanes * 2 * BLOCK_SIZE_ULONG + lane * 2 * BLOCK_SIZE_ULONG;
 	__global ulong *seed_dst = memory + (lane * lane_length * 2 + hash_idx) * BLOCK_SIZE_ULONG;
 
-	vstore4(vload4(id, seed_mem), id, seed_dst);
+	vstore4((ulong4)(seed_mem[i1_0], seed_mem[i1_1], seed_mem[i1_2], seed_mem[i1_3]), id, seed_dst);
 
 	seed_mem += BLOCK_SIZE_ULONG;
 	seed_dst += (2 * BLOCK_SIZE_ULONG);
 
-	vstore4(vload4(id, seed_mem), id, seed_dst);
+	vstore4((ulong4)(seed_mem[i1_0], seed_mem[i1_1], seed_mem[i1_2], seed_mem[i1_3]), id, seed_dst);
 
 	__global ulong *next_block;
 	__global ulong *prev_block;
@@ -851,7 +849,7 @@ __kernel void fill_blocks(__global ulong *chunk_0,
 
 		prev_block = memory + prev_idx * 2 * BLOCK_SIZE_ULONG;
 
-		tmp = vload4(wave_id, prev_block);
+		data = vload4(wave_id, prev_block);
 
         if(seg_type == 0) {
             seg_refs = refs + ((s * lanes + lane) * seg_length - ((s > 0) ? lanes : lane) * 2);
@@ -862,7 +860,7 @@ __kernel void fill_blocks(__global ulong *chunk_0,
                 cur_idx = seg_idxs[0];
             }
 
-            ulong4 nextref = vload4(wave_id, memory + ref_idx * 2 * BLOCK_SIZE_ULONG);
+            ref = vload4(wave_id, memory + ref_idx * 2 * BLOCK_SIZE_ULONG);
 
             for (int i=0;idx < seg_length;i++, idx++) {
     			next_block = memory + (cur_idx & 0x7FFFFFFF) * 2 * BLOCK_SIZE_ULONG;
@@ -870,7 +868,7 @@ __kernel void fill_blocks(__global ulong *chunk_0,
                 if(with_xor == 1)
                     next = vload4(wave_id, next_block);
 
-                ref = nextref;
+                data ^= ref;
 
                 if (idx < seg_length - 1) {
                     ref_idx = seg_refs[i + 1];
@@ -882,31 +880,30 @@ __kernel void fill_blocks(__global ulong *chunk_0,
                     else
                         cur_idx++;
 
-                    nextref = vload4(wave_id, memory + ref_idx * 2 * BLOCK_SIZE_ULONG);
+                    ref = vload4(wave_id, memory + ref_idx * 2 * BLOCK_SIZE_ULONG);
                 }
 
-                tmp ^= ref;
+                save = data;
 
-                vstore4(tmp, id, state);
-
-                G1(state);
-                G2(state);
-                G3(state);
-                G4(state);
+                G1(state, data.x, data.y, data.z, data.w);
+                G2(state, data.x, data.y, data.z, data.w);
+                G3(state, data.x, data.y, data.z, data.w);
+                G4(state, data.x, data.y, data.z, data.w);
 
                 if(with_xor == 1)
-                    tmp ^= next;
+                    save ^= next;
 
-                tmp ^= vload4(id, state);
+                data ^= save;
 
                 if(keep > 0) {
-                    vstore4(tmp, wave_id, next_block);
+                    vstore4(data, wave_id, next_block);
                     barrier(CLK_GLOBAL_MEM_FENCE);
                 }
             }
         }
         else {
-            vstore4(tmp, id, state);
+            if(id == 0)
+                vstore4(data, id, state);
             barrier(CLK_LOCAL_MEM_FENCE);
 
             for (int i=0;idx < seg_length;i++, idx++, cur_idx++) {
@@ -964,36 +961,41 @@ __kernel void fill_blocks(__global ulong *chunk_0,
                 if(with_xor == 1)
                     next = vload4(wave_id, next_block);
 
-                tmp ^= ref;
+                data ^= ref;
+                save = data;
 
-                vstore4(tmp, id, state);
-
-                G1(state);
-                G2(state);
-                G3(state);
-                G4(state);
+                G1(state, data.x, data.y, data.z, data.w);
+                G2(state, data.x, data.y, data.z, data.w);
+                G3(state, data.x, data.y, data.z, data.w);
+                G4(state, data.x, data.y, data.z, data.w);
 
                 if(with_xor == 1)
-                    tmp ^= next;
+                    save ^= next;
 
-                tmp ^= vload4(id, state);
+                data ^= save;
 
-                vstore4(tmp, id, state);
-                vstore4(tmp, wave_id, next_block);
+                if(id == 0)
+                    vstore4(data, id, state);
+                vstore4(data, wave_id, next_block);
                 barrier(CLK_GLOBAL_MEM_FENCE | CLK_LOCAL_MEM_FENCE);
             }
         }
     }
 
-    vstore4(tmp, id, state);
+    state[i1_0] = data.x;
+    state[i1_1] = data.y;
+    state[i1_2] = data.z;
+    state[i1_3] = data.w;
+
     barrier(CLK_LOCAL_MEM_FENCE);
 
 	if(lane == 0) { // first lane needs to acumulate results
-    	__global ulong *out_mem = out + hash * BLOCK_SIZE_ULONG;
-		for(int l=1; l<lanes; l++)
-            tmp ^= vload4(id, scratchpad + (l * 2 + hash_idx) * BLOCK_SIZE_ULONG);
+        data = (ulong4)(0, 0, 0, 0);
+		for(int l=0; l<lanes; l++)
+            data ^= vload4(id, scratchpad + (l * 2 + hash_idx) * BLOCK_SIZE_ULONG);
 
-        vstore4(tmp, id, out_mem);
+    	__global ulong *out_mem = out + hash * BLOCK_SIZE_ULONG;
+        vstore4(data, id, out_mem);
 	}
 };
 
