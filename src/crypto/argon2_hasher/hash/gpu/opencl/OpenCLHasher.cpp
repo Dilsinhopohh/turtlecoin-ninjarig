@@ -2,6 +2,8 @@
 // Created by Haifa Bogdan Adnan on 03/08/2018.
 //
 
+#if defined(WITH_OPENCL)
+
 #include <crypto/Argon2_constants.h>
 #include "../../../common/common.h"
 
@@ -12,8 +14,6 @@
 #include "OpenCLKernel.h"
 
 #include "crypto/argon2_hasher/common/DLLExport.h"
-
-#if defined(WITH_OPENCL)
 
 #ifndef CL_DEVICE_BOARD_NAME_AMD
 #define CL_DEVICE_BOARD_NAME_AMD                    0x4038

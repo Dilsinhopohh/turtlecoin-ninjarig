@@ -8,6 +8,7 @@ option(WITH_TLS             "Enable OpenSSL support" ON)
 option(WITH_EMBEDDED_CONFIG "Enable internal embedded JSON config" OFF)
 option(WITH_CUDA            "Enable CUDA support" ON)
 option(WITH_OPENCL          "Enable OpenCL support" ON)
+option(WITH_AMDGCN          "Enable AMDGCN support" ON)
 option(WITH_OPENCL_DOUBLE_THREADS  "Enable dual threads for OpenCL jobs" OFF)
 option(WITH_CUDA_DOUBLE_THREADS  "Enable dual threads for CUDA jobs" ON)
 
@@ -175,6 +176,10 @@ set(SOURCE_OPENCL_HASHER src/crypto/argon2_hasher/hash/gpu/opencl/OpenCLHasher.c
 
 set(SOURCE_CUDA_HASHER src/crypto/argon2_hasher/hash/gpu/cuda/CudaHasher.cpp src/crypto/argon2_hasher/hash/gpu/cuda/CudaHasher.h
         src/crypto/argon2_hasher/hash/gpu/cuda/cuda_kernel.cu)
+
+set(SOURCE_AMDGCN_HASHER src/crypto/argon2_hasher/hash/gpu/amdgcn/AMDGCNHasher.cpp src/crypto/argon2_hasher/hash/gpu/amdgcn/AMDGCNHasher.h
+        src/crypto/argon2_hasher/hash/gpu/amdgcn/AMDGCN_OCL_Kernels.cpp src/crypto/argon2_hasher/hash/gpu/amdgcn/AMDGCN_GCN_Kernels.cpp
+        src/crypto/argon2_hasher/hash/gpu/amdgcn/AMDGCN_Kernels.h)
 
 set(ARGON2_FILL_BLOCKS_SRC
         src/crypto/argon2_hasher/hash/cpu/argon2_opt/implementation.c
@@ -388,6 +393,28 @@ if(WITH_OPENCL)
             )
     target_link_libraries(opencl_hasher argon2_common ${OpenCL_LIBRARY})
     add_dependencies(${CMAKE_PROJECT_NAME} opencl_hasher)
+endif()
+
+if(WITH_AMDGCN)
+    if(NOT WITH_OPENCL)
+        find_package(OpenCL REQUIRED)
+    endif()
+    add_definitions(-DWITH_AMDGCN)
+    list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/src/crypto/argon2_hasher/hash/gpu/amdgcn/CLRX/cmake")
+    add_subdirectory("src/crypto/argon2_hasher/hash/gpu/amdgcn/CLRX")
+    include_directories("src/crypto/argon2_hasher/hash/gpu/amdgcn/CLRX")
+    include_directories("${PROJECT_BINARY_DIR}/src/crypto/argon2_hasher/hash/gpu/amdgcn/CLRX/")
+
+    add_library(amdgcn_hasher MODULE ${SOURCE_AMDGCN_HASHER})
+    set_target_properties(amdgcn_hasher
+            PROPERTIES
+            PREFIX ""
+            SUFFIX ".hsh"
+            LIBRARY_OUTPUT_DIRECTORY modules
+            )
+    target_link_libraries(amdgcn_hasher argon2_common CLRXCLHelperStatic CLRXAmdAsmStatic
+            CLRXAmdBinStatic CLRXUtilsStatic ${OpenCL_LIBRARY})
+    add_dependencies(${CMAKE_PROJECT_NAME} amdgcn_hasher)
 endif()
 
 if(WITH_CUDA)
